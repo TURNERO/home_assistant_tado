@@ -19,19 +19,13 @@ blueprint:
           multiple: false
     tado_climate:
       name: Tado climate entity (HomeKit)
-      description: Used to read the Tado's current temperature.
+      description: >
+        Used to read the Tado's current temperature. The Hijack offset entity
+        (number.<same name>_temperature_offset) is derived from this.
       selector:
         entity:
           domain: climate
           integration: homekit_controller
-          multiple: false
-    offset_number:
-      name: Tado offset number (Hijack)
-      description: The Tado Hijack temperature offset entity, used to set the offset.
-      selector:
-        entity:
-          domain: number
-          integration: tado_hijack
           multiple: false
     offset_storage:
       name: Offset storage (optional)
@@ -98,7 +92,7 @@ mode: single
 variables:
   source_sensor: !input source_sensor
   tado_climate: !input tado_climate
-  offset_number: !input offset_number
+  offset_number: "{{ 'number.' ~ tado_climate.split('.')[1] ~ '_temperature_offset' }}"
   offset_storage: !input offset_storage
   gain: !input gain
   deadband: !input deadband
@@ -120,7 +114,7 @@ condition:
       {{ is_number(state_attr(tado_climate, 'current_temperature'))
          and is_number(states(source_sensor)) }}
   - condition: template
-    value_template: "{{ not is_state(offset_number, 'unavailable') }}"
+    value_template: "{{ states[offset_number] is not none and not is_state(offset_number, 'unavailable') }}"
   - condition: template
     value_template: >
       {{ (states(source_sensor) | float - state_attr(tado_climate, 'current_temperature') | float)
