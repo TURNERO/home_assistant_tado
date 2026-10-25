@@ -1,0 +1,176 @@
+blueprint:
+  name: Tado temperature offset (Hijack, damped)
+  description: |
+    Calibrates a Tado radiator thermostat to a separate temperature sensor by
+    adjusting its temperature offset (via Tado Hijack) in small steps.
+
+    Tado's reported temperature is slow to update and the offset cannot be read
+    back reliably, so each run applies only a fraction of the error, then waits
+    for Tado to report a new temperature before correcting again.
+  domain: automation
+  input:
+    source_sensor:
+      name: Reference temperature sensor
+      description: Accurate room sensor the Tado reading is matched to.
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+          multiple: false
+    tado_climate:
+      name: Tado climate entity (HomeKit)
+      description: Used to read the Tado's current temperature.
+      selector:
+        entity:
+          domain: climate
+          integration: homekit_controller
+          multiple: false
+    offset_number:
+      name: Tado offset number (Hijack)
+      description: The Tado Hijack temperature offset entity, used to set the offset.
+      selector:
+        entity:
+          domain: number
+          integration: tado_hijack
+          multiple: false
+    offset_storage:
+      name: Offset storage (optional)
+      description: >
+        Optional input_number (min -9.9, max 10, step 0.1) remembering the last
+        offset set. Leave empty to use the offset number's own state.
+      default: ""
+      selector:
+        entity:
+          domain: input_number
+          multiple: false
+    gain:
+      name: Gain
+      description: Fraction of the error corrected per step. Lower is slower and safer.
+      default: 0.5
+      selector:
+        number:
+          min: 0.1
+          max: 1.0
+          step: 0.05
+    deadband:
+      name: Deadband
+      description: Do nothing while the difference is smaller than this (°C).
+      default: 0.3
+      selector:
+        number:
+          min: 0.1
+          max: 2.0
+          step: 0.1
+          unit_of_measurement: °C
+    max_step:
+      name: Maximum step
+      description: Largest offset change per correction (°C).
+      default: 1.0
+      selector:
+        number:
+          min: 0.1
+          max: 5.0
+          step: 0.1
+          unit_of_measurement: °C
+    persistence_minutes:
+      name: Persistence
+      description: Minutes a new Tado reading must persist before acting, and the pause after it changes.
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+          unit_of_measurement: min
+    settle_minutes:
+      name: Settle timeout
+      description: Maximum minutes to wait for Tado to report a new temperature after a change.
+      default: 30
+      selector:
+        number:
+          min: 5
+          max: 180
+          step: 5
+          unit_of_measurement: min
+
+mode: single
+
+variables:
+  source_sensor: !input source_sensor
+  tado_climate: !input tado_climate
+  offset_number: !input offset_number
+  offset_storage: !input offset_storage
+  gain: !input gain
+  deadband: !input deadband
+  max_step: !input max_step
+  persistence_minutes: !input persistence_minutes
+  settle_minutes: !input settle_minutes
+
+trigger:
+  - platform: state
+    entity_id: !input tado_climate
+    attribute: current_temperature
+    for:
+      minutes: !input persistence_minutes
+
+condition:
+  # Both temperatures must be real numbers (no unknown/unavailable fallbacks).
+  - condition: template
+    value_template: >
+      {{ is_number(state_attr(tado_climate, 'current_temperature'))
+         and is_number(states(source_sensor)) }}
+  - condition: template
+    value_template: "{{ not is_state(offset_number, 'unavailable') }}"
+  - condition: template
+    value_template: >
+      {{ (states(source_sensor) | float - state_attr(tado_climate, 'current_temperature') | float)
+         | abs >= deadband | float }}
+
+action:
+  - variables:
+      error: >
+        {{ states(source_sensor) | float - state_attr(tado_climate, 'current_temperature') | float }}
+      # Baseline: stored offset, else the number's state, else assume 0.
+      baseline: >
+        {{ states(offset_storage) | float
+           if offset_storage != '' and is_number(states(offset_storage))
+           else (states(offset_number) | float if is_number(states(offset_number)) else 0) }}
+      step: >
+        {{ [[gain | float * error | float, -(max_step | float)] | max, max_step | float] | min }}
+      new_offset: >
+        {{ [[baseline | float + step | float, -9.9] | max, 10.0] | min | round(1) }}
+  - if:
+      - condition: template
+        value_template: "{{ new_offset != baseline | float }}"
+    then:
+      - service: system_log.write
+        data:
+          logger: blueprints.tado.offset
+          level: info
+          message: >
+            {{ tado_climate }}: Tado {{ state_attr(tado_climate, 'current_temperature') }},
+            reference {{ states(source_sensor) }}, offset {{ baseline }} -> {{ new_offset }}
+      - service: number.set_value
+        target:
+          entity_id: "{{ offset_number }}"
+        data:
+          value: "{{ new_offset }}"
+      - if:
+          - condition: template
+            value_template: "{{ offset_storage != '' }}"
+        then:
+          - service: input_number.set_value
+            target:
+              entity_id: "{{ offset_storage }}"
+            data:
+              value: "{{ new_offset }}"
+      # Let Tado report a reading that reflects the change before correcting again.
+      - wait_for_trigger:
+          - platform: state
+            entity_id: !input tado_climate
+            attribute: current_temperature
+        timeout:
+          minutes: "{{ settle_minutes | int }}"
+        continue_on_timeout: true
+      - delay:
+          minutes: "{{ persistence_minutes | int }}"
